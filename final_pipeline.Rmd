@@ -1,0 +1,1376 @@
+---
+title: "Final_pipeline"
+author: Shuqi Zhao
+date: "2026-03-12"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+bibliography: references.bib
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(lubridate)
+
+library(tidymodels)
+library(vip)
+library(doParallel)
+
+library(corrplot)
+library(patchwork)
+library(tidyllm)
+
+library(fastshap)
+library(shapviz)
+
+library(kableExtra)
+```
+
+## Repository Link
+
+Code and data repository for this project:
+
+https://github.com/suzyzhao273/MACS30100
+
+
+
+# Introduction
+
+In the digital music era, the success of a song is shaped not only by its musical characteristics but also by the dynamics of online discussion. Social media platforms have become central spaces where fans share, promote, and debate music releases, potentially amplifying attention toward certain songs and influencing their market performance. As music consumption increasingly occurs in digitally connected environments, online discussions may play an important role in shaping how songs gain visibility and spread among audiences. This raises an important question: can online discussions help predict how well a song performs in commercial music charts?
+
+Research on cultural markets suggests that success is often difficult to predict when relying solely on the intrinsic characteristics of cultural products. Classic work by @salganik2006 shows that cultural products can experience highly unequal and unpredictable outcomes due to social dynamics and collective influence. Even when the quality of a product is held constant, social interactions among audiences can generate large differences in popularity. Subsequent studies have attempted to predict musical success using song-level features such as acoustic characteristics, musical structure, or lyrical attributes, but their predictive power remains limited [@interiano2018musical]. These findings suggest that musical characteristics alone may not fully explain why some songs achieve greater commercial success than others.
+
+More recent research has therefore turned to online behavioral data to better understand the diffusion of music. For example, @araujo2017predicting examine whether user comments on Twitter prior to album release can help predict musical success. Their findings suggest that online discussions may contain useful signals about audience attention and future performance. Other studies further emphasize the importance of social interaction and network effects in shaping music diffusion. In particular, @reisz2024quantifying show that incorporating social-network structures significantly improves the prediction of song popularity, while @oliveira2024viral highlight the importance of extrinsic factors—such as artist-related characteristics and temporal dynamics—in distinguishing viral songs from ordinary hits. Together, these studies suggest that social interaction and online attention play a key role in shaping the success of music in digital environments.
+
+Building on this literature, this study examines whether online discussions in social media communities are associated with chart performance. The main research question of this study is therefore: How are online discussion volume and controversy related to a song’s peak chart performance? 
+
+In this study, I focus on a concrete measure of success—the peak chart position achieved by a song on the Billboard Hot 100 within a year, which reflects its commercial visibility in the music market.
+
+Among social platforms, Reddit hosts large and active music communities where users frequently discuss newly released songs. For example, the subreddit r/music is one of the largest music discussion communities on Reddit, with millions of visitors and tens of thousands of weekly contributions since its creation in 2008. Discussions on such platforms often include both enthusiastic fan engagement and intense debates about artists and songs. These discussions can therefore be characterized along two key dimensions: volume and controversy. Discussion volume reflects the level of attention a song receives within online communities, measured by the number of posts mentioning the song or artist. Controversy captures the extent to which discussions involve disagreement, conflict, or polarized reactions within the community.
+
+Based on these considerations, this study evaluates two expectations regarding online discussion dynamics and music chart performance. First, higher discussion volume may indicate greater audience attention and visibility, which could increase the likelihood that a song spreads more widely and achieves stronger chart performance. Second, controversial discussions may also attract attention and engagement, potentially amplifying information diffusion around a song.
+
+Accordingly, this study evaluates the following hypotheses:
+
+H1: Higher online discussion volume is associated with stronger chart performance.
+
+H2: Higher levels of discussion controversy are associated with stronger chart performance.
+
+
+# Data Sources
+
+This study combines two sources of data. The first source is MusicOSet, an open music dataset that provides song-level metadata, chart-related information, and musical features, including lyrics and acoustic attributes [@silva2019musicoset]. From this dataset, I obtain the main song-level information used in the analysis, including release year, artist metadata, Billboard chart performance, audio features, and lyrics-based information.
+
+The second source is historical Reddit data. Because the current Reddit API is
+difficult to use for large-scale historical collection, I rely on publicly
+available Reddit archive files compiled from Pushshift-based dumps
+[@watchful1reddit]. Specifically, I use the submission history of the subreddit
+*r/music*, one of the largest music discussion communities on Reddit.
+
+Due to data availability, the sample is restricted to songs released between 2008 and 2018.
+
+
+# Variable Construction
+
+The main outcome variable is *peak chart position*, defined as the highest rank achieved by a song on the Billboard Hot 100 within a year. This variable captures the commercial visibility of a song in the music market.
+
+The key explanatory variables are derived from Reddit discussions in *r/music*. I focus on a release window spanning 7 days before release through 7 days after release, including the release day itself, for a total of 15 days. Within this window, I construct two main measures: discussion volume and discussion controversy.
+
+Discussion volume measures the amount of attention a song receives on Reddit. It is defined as the number of Reddit submissions mentioning the song or artist during the release window. In the regression models, I use both an indicator for whether a song received any Reddit mention (`has_volume`) and a log-transformed count of mentions (`log_volume`).
+
+Discussion controversy is designed to capture disagreement or unusually intense discussion relative to community approval. At the post level, controversy is defined as
+
+$$
+\text{controversy}_{post} = \frac{\text{num\_comments}}{|\text{score}| + 1}
+$$
+
+where `score` is the Reddit post score and `num_comments` is the number of comments. This measure assigns higher values to posts that generate many comments but relatively limited net approval, which may indicate disagreement, conflict, or polarized reactions.
+
+Song-level controversy is then calculated as the weighted average of post-level controversy scores across matched posts within the release window:
+
+$$
+\text{controversy}_{song} =
+\frac{\sum (\text{controversy}_{post} \times \text{weight})}{\sum \text{weight}}
+$$
+
+When a single Reddit submission is matched to multiple songs, its contribution is weighted by the inverse of the number of matched songs:
+
+$$
+\text{weight} = \frac{1}{\text{number of matched songs}}
+$$
+
+This weighting rule ensures that each post contributes proportionally rather than being fully duplicated across all matched songs. The final variable used in the analysis is the log-transformed controversy measure (`log_controversy`).
+
+In addition to these predictors, the analysis includes a set of control variables drawn from MusicOSet, including release year, artist follower counts, artist type, Spotify audio features, track duration, and principal components derived from lyrics embeddings.
+
+Table 1 reports the definitions of the main variables used in the analysis.
+
+```{r variables, message=FALSE, warning=FALSE,echo=FALSE}
+
+var_table <- tribble(
+  ~Variable, ~Type, ~Description,
+  
+  "peak_position", "Outcome",
+  "Best chart rank achieved by a song on the Billboard Hot 100 within a year",
+  
+  "has_volume", "Predictor",
+  "Indicator for whether the song or artist was mentioned on Reddit during the release window",
+  
+  "log_volume", "Predictor",
+  "Log-transformed number of Reddit posts mentioning the song or artist during the release window. Song-level volume is the weighted average of post-level scores across matched posts",
+  
+  "log_controversy", "Predictor",
+  "Log-transformed measure of discussion controversy. Post-level controversy is defined as num_comments/(|score|+1). Song-level controversy is the weighted average of post-level scores across matched posts",
+  
+  "release_year", "Control",
+  "Year of song release",
+  
+  "log_followers", "Control",
+  "Log-transformed number of artist followers",
+  
+  
+  "danceability", "Control",
+  "Spotify audio feature measuring how suitable a track is for dancing",
+  
+  "energy", "Control",
+  "Spotify audio feature measuring intensity and activity",
+  
+  "loudness", "Control",
+  "Average loudness of the track in decibels",
+  
+  "speechiness", "Control",
+  "Spotify audio feature measuring the presence of spoken words",
+  
+  "acousticness", "Control",
+  "Spotify audio feature measuring the probability that the track is acoustic",
+  
+  "instrumentalness", "Control",
+  "Spotify audio feature predicting whether a track contains no vocals",
+  
+  "liveness", "Control",
+  "Spotify audio feature detecting the presence of an audience",
+  
+  "valence", "Control",
+  "Spotify audio feature describing musical positiveness",
+  
+  "tempo", "Control",
+  "Estimated tempo in beats per minute",
+  
+  "log_duration", "Control",
+  "Log-transformed track duration",
+  
+  "lyrics", "Control",
+  "songs' lyrics"
+)
+
+kable(var_table, caption = "Variable Definitions") %>%
+  kable_styling(full_width = FALSE)
+```
+
+# Modeling Approach
+
+The models aim to predict the peak chart position of a song using information about Reddit discussion activity together with song-level characteristics.
+
+The prediction task can be conceptually represented as:
+
+$$
+\text{peak_position}_i =
+f(\text{volume}_i, \text{controversy}_i,\text{controls}_i)
+$$
+
+where \(f(\cdot)\) denotes the predictive function estimated by machine learning models. 
+The key predictors of interest are the discussion volume and controversy measures derived 
+from Reddit activity, while song-level characteristics and artist attributes are included 
+as control variables.
+
+# Machine Learning Pipeline
+
+## Data Preparation and EDA
+
+Table 2 summarizes the missing values in the raw dataset. Some variables contain a relatively large proportion of missing observations, particularly the aggregated Reddit text variables (e.g., `music_text_joined_baseline` and `music_text_joined_release`) and album metadata such as `album_name`. These variables are not used directly in the regression models and therefore do not affect the final modeling dataset.
+
+For variables that are used in the analysis, the level of missingness is generally low. The lyrics variable contains a small proportion of missing observations (about 4.4%). Because lyrics data are unavailable for some songs and cannot be reliably imputed, observations with missing lyrics are removed.
+
+The outcome variables (`rank_score`, `peak_position`, and `weeks_on_chart`) contain only two missing observations. Since outcome variables should not be imputed, these cases are also removed from the dataset. Given the extremely small proportion of missing outcomes, listwise deletion is unlikely to introduce meaningful bias or substantially reduce the sample size.
+
+```{r clean-data-1, message=FALSE, warning=FALSE}
+df <- read_csv("final_with_artist_controls.csv")
+
+# glimpse(df)
+# summary(df)
+
+# Check for missing values (NAs) 
+# to determine the appropriate imputation strategy
+
+na_summary <- df %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "n_missing"
+  ) %>%
+  mutate(missing_pct = n_missing / nrow(df)) %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing))
+
+knitr::kable(na_summary, 
+             caption = "Summary of Variables with Missing Values",
+             digits = 3)
+
+```
+
+
+
+```{r clean-data-2, message=FALSE, warning=FALSE, include=FALSE}
+
+df_clean <- df %>%
+  mutate(
+   # Reddit joined text is not included in the regression model,
+    # because volume and controversy have already been operationalized
+    # as structured numeric measures. We therefore replace missing text
+    # with empty strings only for safe text handling.
+    music_text_joined_baseline = if_else(
+      is.na(music_text_joined_baseline), "", music_text_joined_baseline
+    ),
+    music_text_joined_release = if_else(
+      is.na(music_text_joined_release), "", music_text_joined_release
+    ),
+    # Lyrics are kept as a potential text source.
+    # Missing lyrics are temporarily converted to empty strings and
+    # will be removed afterward, since meaningful imputation is not feasible.
+    lyrics = if_else(
+      is.na(lyrics), "", lyrics
+    ),
+    
+    # Clean added artist control variables
+    artist_type = str_trim(artist_type),
+    artist_type = na_if(artist_type, "-"),
+    artist_type = na_if(artist_type, ""),
+    
+    main_genre = str_trim(main_genre),
+    main_genre = na_if(main_genre, "-"),
+    main_genre = na_if(main_genre, "")
+  ) %>%
+  
+ 
+  # Drop rows with missing dependent variables
+  # Since rank_score / peak_position / weeks_on_chart
+  # are outcomes, they should not be imputed.
+  # Missingness is extremely low, so listwise deletion
+  # is acceptable here.
+
+  filter(
+    !is.na(rank_score),
+    !is.na(peak_position),
+    !is.na(weeks_on_chart)
+  ) 
+
+
+```
+
+
+```{r clean-data, message=FALSE, warning=FALSE, include=FALSE}
+
+# 4. Create transformed variables
+# Use log transformation for skewed count-like variables.
+# log1p(x) = log(1 + x), which safely handles zeros.
+df_clean <- df_clean %>%
+  mutate(
+    # Duration transformation
+    log_duration = log(duration_ms),
+    
+    # Reddit volume transformations
+    log_music_volume_baseline = log1p(music_volume_baseline),
+    log_music_volume_release  = log1p(music_volume_release),
+    
+    # Reddit controversy transformations
+    log_music_controversy_baseline = log1p(music_controversy_baseline),
+    log_music_controversy_release  = log1p(music_controversy_release),
+    
+    # followers transformation
+    log_followers = log1p(followers),
+    
+    # Time variable
+    release_year = year(release_date)
+  )
+
+
+# Remove redundant / unnecessary columns
+# Drop artist match count variables because they are highly
+# redundant with volume variables.
+# Drop text_list columns because joined text is already enough.
+df_clean <- df_clean %>%
+  select(
+    -music_artist_match_count_raw_baseline,
+    -music_artist_match_count_raw_release,
+    -music_text_list_baseline,
+    -music_text_list_release
+  )
+
+
+# reorder columns for readability
+# Put outcomes, transformed variables, and important metadata
+# near the front of the dataset.
+df_clean <- df_clean %>%
+  select(
+    # Outcomes
+    rank_score,
+    peak_position,
+    weeks_on_chart,
+    
+    # Basic identifiers
+    song_name,
+    artist_name,
+    album_name,
+    release_date,
+    release_year,
+    
+    # artist controls
+    followers,
+    log_followers,
+    artist_type,
+    main_genre,
+    
+    # Audio / music features
+    danceability,
+    energy,
+    key,
+    loudness,
+    mode,
+    speechiness,
+    acousticness,
+    instrumentalness,
+    liveness,
+    valence,
+    tempo,
+    duration_ms,
+    log_duration,
+    time_signature,
+    
+    # Original Reddit features
+    music_volume_baseline,
+    music_volume_release,
+    music_controversy_baseline,
+    music_controversy_release,
+    
+    # Transformed Reddit features
+    log_music_volume_baseline,
+    log_music_volume_release,
+    log_music_controversy_baseline,
+    log_music_controversy_release,
+    
+    # Text fields
+    lyrics,
+    music_text_joined_baseline,
+    music_text_joined_release,
+    
+    # Everything else not explicitly listed above
+    everything()
+  )
+
+
+
+# Quick duplicate check
+# Check whether the dataset has duplicate song-level rows.
+duplicate_rows <- df_clean %>%
+  count(song_name, artist_name, release_date) %>%
+  filter(n > 1)
+
+print(duplicate_rows)
+
+
+
+# Save cleaned dataset
+write_csv(df_clean, "final_cleaned.csv")
+
+
+# Final confirmation
+glimpse(df_clean)
+summary(df_clean)
+
+```
+
+
+
+Figure 1 provides an overview of Reddit discussion presence and its relationship with chart outcomes. A notable feature of the dataset is that a large number of songs receive no Reddit discussion during the release window. This sparsity is partly due to the early years of the sample period (2008–2018), when online music discussion communities were smaller and social media engagement around music releases was less structured than today. As a result, many songs in the dataset do not appear in Reddit discussions.
+
+Despite this sparsity, songs that receive Reddit discussion tend to show slightly better chart performance. In particular, songs with Reddit mentions exhibit somewhat higher rank scores and peak chart positions compared with songs without discussion. However, the number of weeks a song remains on the chart does not appear to differ substantially between the two groups.
+
+To further examine these relationships, Figures 2 and 3 focus on songs that do receive Reddit discussion. For ease of interpretation, all outcome variables—rank_score, peak_position, and weeks_on_chart—are defined so that higher values indicate stronger chart performance.
+
+Within this subset, discussion volume shows different associations with different performance measures. Higher discussion volume is associated with somewhat better peak chart positions, while its relationship with rank score appears relatively weak. Interestingly, higher discussion volume is slightly negatively associated with weeks on chart, suggesting that songs generating large bursts of discussion may achieve strong short-term visibility but do not necessarily sustain long-term chart presence.
+
+A similar pattern emerges for the controversy measure. Higher levels of controversy are associated with somewhat higher peak chart positions, but they are also linked to fewer weeks on the chart. This pattern suggests that controversy may amplify short-term attention and visibility but does not necessarily translate into sustained popularity over time.
+
+```{r EDA, message=FALSE, warning=FALSE, echo=FALSE}
+
+df <- read_csv("final_cleaned.csv") %>%
+  mutate(
+    has_reddit_release = music_volume_release > 0
+  )
+
+# Common theme for EDA plots
+theme_eda <- theme_minimal(base_size = 10) +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 9),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9)
+  )
+
+
+# Reddit sparsity / binary presence
+p_presence_bar <- ggplot(df, aes(x = factor(has_reddit_release))) +
+  geom_bar() +
+  labs(
+    title = "Reddit Presence",
+    x = "Has Discussion",
+    y = "Number of Songs"
+  ) +
+  theme_eda
+
+p_presence_rank <- ggplot(
+  df %>% filter(!is.na(rank_score)),
+  aes(x = factor(has_reddit_release), y = rank_score)
+) +
+  geom_boxplot() +
+  labs(
+    title = "Rank Score",
+    x = "Has Discussion",
+    y = "Rank Score"
+  ) +
+  theme_eda
+
+p_presence_peak <- ggplot(
+  df %>% filter(!is.na(peak_position)),
+  aes(x = factor(has_reddit_release), y = peak_position)
+) +
+  geom_boxplot() +
+  labs(
+    title = "Peak Position",
+    x = "Has Discussion",
+    y = "Peak Position"
+  ) +
+  theme_eda
+
+p_presence_weeks <- ggplot(
+  df %>% filter(!is.na(weeks_on_chart)),
+  aes(x = factor(has_reddit_release), y = weeks_on_chart)
+) +
+  geom_boxplot() +
+  labs(
+    title = "Weeks on Chart",
+    x = "Has Discussion",
+    y = "Weeks on Chart"
+  ) +
+  theme_eda
+
+presence_panel <- ((p_presence_bar | p_presence_rank) /
+                   (p_presence_peak | p_presence_weeks)) +
+  plot_annotation(
+    title = "Reddit Sparsity and Discussion Presence",
+    theme = theme(
+      plot.title = element_text(size = 14, face = "bold")
+    )
+  )
+
+presence_panel
+
+
+# Keep only songs with Reddit discussion
+df_pos <- df %>%
+  filter(music_volume_release > 0)
+
+df_vol <- df_pos %>%
+  filter(
+    is.finite(log_music_volume_release),
+    is.finite(rank_score),
+    is.finite(peak_position),
+    is.finite(weeks_on_chart)
+  )
+
+df_con <- df_pos %>%
+  filter(
+    is.finite(log_music_controversy_release),
+    is.finite(rank_score),
+    is.finite(peak_position),
+    is.finite(weeks_on_chart)
+  )
+
+
+# Volume vs outcomes
+p_vol_rank <- ggplot(df_vol, aes(x = log_music_volume_release, y = rank_score)) +
+  geom_point(alpha = 0.12, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(
+    title = "Volume vs Rank",
+    x = "Log Volume",
+    y = "Rank Score"
+  ) +
+  theme_eda
+
+p_vol_peak <- ggplot(df_vol, aes(x = log_music_volume_release, y = peak_position)) +
+  geom_point(alpha = 0.12, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(
+    title = "Volume vs Peak",
+    x = "Log Volume",
+    y = "Peak Position"
+  ) +
+  theme_eda
+
+p_vol_weeks <- ggplot(df_vol, aes(x = log_music_volume_release, y = weeks_on_chart)) +
+  geom_point(alpha = 0.12, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(
+    title = "Volume vs Weeks",
+    x = "Log Volume",
+    y = "Weeks on Chart"
+  ) +
+  theme_eda
+
+volume_panel <- (p_vol_rank | p_vol_peak | p_vol_weeks) +
+  plot_annotation(
+    title = "Among Songs with Discussion: Volume and Outcomes",
+    theme = theme(
+      plot.title = element_text(size = 14, face = "bold")
+    )
+  )
+
+volume_panel
+
+
+# Controversy vs outcomes
+p_con_rank <- ggplot(df_con, aes(x = log_music_controversy_release, y = rank_score)) +
+  geom_point(alpha = 0.12, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(
+    title = "Controversy vs Rank",
+    x = "Log Controversy",
+    y = "Rank Score"
+  ) +
+  theme_eda
+
+p_con_peak <- ggplot(df_con, aes(x = log_music_controversy_release, y = peak_position)) +
+  geom_point(alpha = 0.12, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(
+    title = "Controversy vs Peak",
+    x = "Log Controversy",
+    y = "Peak Position"
+  ) +
+  theme_eda
+
+p_con_weeks <- ggplot(df_con, aes(x = log_music_controversy_release, y = weeks_on_chart)) +
+  geom_point(alpha = 0.12, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(
+    title = "Controversy vs Weeks",
+    x = "Log Controversy",
+    y = "Weeks on Chart"
+  ) +
+  theme_eda
+
+controversy_panel <- (p_con_rank | p_con_peak | p_con_weeks) +
+  plot_annotation(
+    title = "Among Songs with Discussion: Controversy and Outcomes",
+    theme = theme(
+      plot.title = element_text(size = 14, face = "bold")
+    )
+  )
+
+controversy_panel
+```
+```{r check_data, message=FALSE, warning=FALSE, include=FALSE}
+cor(df$rank_score, df$peak_position, use = "complete.obs")
+# In this dataset, higher values for peak_position actually represent stronger chart performance. 
+# Since peak_position is positively correlated ($r = 0.47$) with rank_score (where higher is better), it confirms that 'Peak Position' is being measured as an achievement metric rather than a literal ranking number.
+```
+
+### Correlation Structure of Variables
+
+To further examine the relationships among variables, Figure 4 presents the pairwise correlation matrix of the numeric variables. Overall, most predictors exhibit relatively weak correlations with one another, suggesting that severe multicollinearity is unlikely to be a major concern.
+
+As expected, the three chart performance variables—rank_score, peak_position, and weeks_on_chart—are strongly correlated with each other because they capture closely related aspects of chart success. To avoid redundancy, the main regression models focus on peak_position as the primary outcome variable.
+
+Among the musical audio features, several moderate correlations appear that reflect known relationships in music acoustics. For example, energy is positively correlated with loudness and negatively correlated with acousticness, which is consistent with the distinction between louder, high-energy tracks and more acoustic recordings.
+
+Discussion-related variables also show meaningful associations. In particular, discussion volume and discussion controversy are positively correlated, indicating that songs that receive more attention on Reddit also tend to generate more controversial or highly commented discussions.
+
+### Hierarchical Clustering
+
+Figure 5 further illustrates the similarity structure among variables using hierarchical clustering based on correlation distances. The clustering results reveal several intuitive groupings.
+
+First, the chart outcome variables—rank_score, peak_position, and weeks_on_chart—form a cluster, reflecting their shared measurement of chart success. Second, discussion-related variables, including discussion volume and controversy, cluster together and are also relatively close to artist popularity measures such as log_followers. This suggests that online attention and artist popularity may be related dimensions of visibility in the music ecosystem.
+
+Finally, most Spotify audio features cluster together, indicating that these musical characteristics capture related aspects of the acoustic profile of songs.
+
+```{r Correlation_and_Clustering, message=FALSE, warning=FALSE, fig.width=12, fig.height=9}
+df <- read_csv("final_cleaned.csv")
+
+
+# Correlation matrix
+numeric_vars <- df %>%
+  select(
+    rank_score, peak_position, weeks_on_chart,
+    release_year,
+    danceability, energy, loudness, speechiness,
+    acousticness, instrumentalness, liveness, valence,
+    tempo, log_duration,log_followers, 
+    log_music_volume_release,
+    log_music_controversy_release
+  )
+
+cor_mat <- cor(numeric_vars, use = "pairwise.complete.obs")
+# print(cor_mat)
+
+corrplot(
+  cor_mat,
+  method = "color",
+  type = "upper",
+  tl.col = "black",
+  tl.cex = 1.4
+)
+
+
+# Hierarchical clustering of numeric features
+cor_dist <- as.dist(1 - cor_mat)
+hc <- hclust(cor_dist, method = "average")
+
+par(mar = c(12, 4, 4, 2))  # larger bottom margin
+plot(
+  hc,
+  main = "Hierarchical Clustering of Numeric Features",
+  cex.main = 2.0,
+  xlab = "",
+  sub = "",
+  cex = 1.2,
+  hang = -1,
+  ylab = "Height"
+)
+abline(h = 1.0, col = "gray50", lty = 2)
+
+```
+
+### Lyrics Embedding
+
+To incorporate lyrical information into the analysis, song lyrics are converted into numerical representations using text embeddings. Specifically, I use the *Voyage-3* embedding model to transform each song’s lyrics into a high-dimensional semantic vector. Text embeddings allow lyrical content to be represented in a way that captures semantic similarity between songs, while making the information usable for statistical and machine learning models.
+
+```{r text_extraction, message=FALSE, warning=FALSE, include=FALSE}
+df <- read_csv("final_cleaned.csv")
+
+
+truncate_text <- function(x,max_chars=12000){
+  if(is.na(x)) return(NA_character_)
+  substr(x,1,max_chars)
+}
+
+df <- df %>%
+  mutate(
+    lyrics = map_chr(lyrics,truncate_text),
+    music_text_joined_release = map_chr(music_text_joined_release,truncate_text)
+  )
+
+lyrics_text_df <- df %>%
+  select(song_id,lyrics) %>%
+  filter(!is.na(lyrics)) %>%
+  distinct(song_id,.keep_all=TRUE)
+
+```
+
+
+```{r embedding, message=FALSE, warning=FALSE, include=FALSE, cache=TRUE}
+
+lyrics_emb_file  <- "lyrics_embeddings.csv"
+
+make_batches <- function(n, batch_size = 16) {
+  split(seq_len(n), ceiling(seq_len(n) / batch_size))
+}
+
+run_embeddings <- function(df, text_col, prefix, batch_size = 16) {
+  
+  batches <- make_batches(nrow(df), batch_size)
+  out_list <- vector("list", length(batches))
+  
+  for (i in seq_along(batches)) {
+    cat("Batch", i, "/", length(batches), "for", prefix, "\n")
+    
+    batch_df <- df[batches[[i]], ]
+    
+    emb <- voyage_embedding(
+      .input = batch_df[[text_col]],
+      .model = "voyage-3"
+    )
+    
+    emb_mat <- do.call(rbind, emb$embeddings)
+    emb_tbl <- as_tibble(emb_mat)
+    names(emb_tbl) <- paste0(prefix, "_", seq_len(ncol(emb_tbl)))
+    
+    out_list[[i]] <- bind_cols(
+      batch_df %>% select(song_id),
+      emb_tbl
+    )
+    
+    Sys.sleep(0.5)
+  }
+  
+  bind_rows(out_list)
+}
+
+# lyrics embedding
+if (file.exists(lyrics_emb_file)) {
+  
+  lyrics_emb <- read_csv(lyrics_emb_file, show_col_types = FALSE)
+  cat("Loaded existing lyrics embeddings.\n")
+  
+} else {
+  
+  lyrics_emb <- run_embeddings(
+    df = lyrics_text_df,
+    text_col = "lyrics",
+    prefix = "lyrics_emb",
+    batch_size = 16
+  )
+  
+  write_csv(lyrics_emb, lyrics_emb_file)
+  cat("Saved lyrics embeddings.\n")
+}
+```
+
+
+```{r merge-embeddings, message=FALSE, warning=FALSE, include=FALSE}
+
+df <- read_csv("final_cleaned.csv", show_col_types = FALSE)
+
+
+lyrics_emb <- read_csv("lyrics_embeddings.csv", show_col_types = FALSE)
+
+# Merge embeddings back to main table
+df_ml <- df %>%
+  inner_join(lyrics_emb, by = "song_id")
+
+# Build modeling table for:
+# peak_position ~ has_volume + log_volume + log_controversy + controls
+df_model <- df_ml %>%
+  mutate(
+    has_volume = if_else(music_volume_release > 0, 1, 0),
+    log_volume = log1p(music_volume_release),
+    log_controversy = log1p(music_controversy_release),
+  ) %>%
+  select(
+    peak_position,
+    rank_score,
+    weeks_on_chart,
+    
+    has_volume,
+    log_volume,
+    log_controversy,
+    
+    release_year,
+    log_followers,
+    
+    danceability,
+    energy,
+    loudness,
+    speechiness,
+    acousticness,
+    instrumentalness,
+    liveness,
+    valence,
+    tempo,
+    log_duration,
+    
+    all_of(names(lyrics_emb)[names(lyrics_emb) != "song_id"])
+  ) 
+
+# glimpse(df_model)
+# dim(df_model)
+
+# colSums(is.na(df_model))
+```
+
+
+```{r build_df_reg, message=FALSE, warning=FALSE, include=FALSE}
+df_reg <- df_model %>%
+  select(
+    peak_position,
+
+    has_volume,
+    log_volume,
+    log_controversy,
+
+    release_year,
+    log_followers,
+
+    danceability,
+    energy,
+    loudness,
+    speechiness,
+    acousticness,
+    instrumentalness,
+    liveness,
+    valence,
+    tempo,
+    log_duration,
+
+    starts_with("lyrics_emb_")
+  )
+
+# df_reg
+
+```
+
+
+
+## Train–Test Split and Cross-Validation
+
+To evaluate model performance, the dataset is divided into training and testing sets. Specifically, 80% of the observations are used for model training, while the remaining 20% are reserved as a held-out test set. The test set is not used during model estimation and serves as an out-of-sample evaluation of predictive performance.
+
+Within the training data, five-fold cross-validation is applied to tune model parameters and reduce the risk of overfitting. In this procedure, the training set is randomly divided into five folds. In each iteration, four folds are used to train the model while the remaining fold is used for validation. This process is repeated five times so that each fold serves as the validation set once.
+
+
+```{r split_cv, message=FALSE, warning=FALSE}
+set.seed(27)
+
+split <- initial_split(df_reg, prop = 0.8)
+
+train_data <- training(split)
+test_data  <- testing(split)
+
+folds <- vfold_cv(train_data, v = 5)
+
+```
+
+
+## Dimensionality Reduction for Lyrics Embeddings
+
+The lyrics embeddings generated by the Voyage-3 model are high-dimensional representations. To incorporate this information into the predictive models while avoiding excessive dimensionality, principal component analysis (PCA) is applied to the embedding vectors.
+
+Figures 6 and 7 present the scree plot and cumulative variance explained by the principal components. The scree plot shows a clear long-tail pattern in which the marginal gain in explained variance declines rapidly after the first several components. In particular, the incremental contribution of additional components becomes relatively small beyond approximately 40 components.
+
+Based on this pattern, the first 40 principal components are retained for subsequent analysis. Although these components explain roughly 40% of the total variance, they capture the dominant semantic structure in the embedding space while avoiding the inclusion of high-dimensional noise. Retaining a larger number of components would substantially increase model complexity while providing limited additional signal.
+
+To avoid information leakage, PCA is estimated using only the training data within the modeling pipeline. The learned transformation is then applied to the validation and test sets.
+
+
+```{r pca, message=FALSE, warning=FALSE}
+emb_cols <- grep("^lyrics_emb_", names(train_data), value = TRUE)
+
+emb_train <- train_data %>%
+  select(all_of(emb_cols))
+
+pca_emb <- prcomp(emb_train, center = TRUE, scale. = TRUE)
+
+scree_df <- tibble(
+  pc = 1:length(pca_emb$sdev),
+  var_explained = pca_emb$sdev^2 / sum(pca_emb$sdev^2),
+  cum_var_explained = cumsum(var_explained)
+)
+
+
+ggplot(scree_df[1:50, ], aes(x = pc, y = var_explained)) +
+  geom_line(size = 0.8) +
+  geom_point(size = 1.5) +
+  labs(
+    title = "Scree Plot: Variance Explained by PCs",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+
+ggplot(scree_df[1:100, ], aes(x = pc, y = cum_var_explained)) +
+  geom_line(size = 0.8) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0.8, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 0.9, linetype = "dashed", color = "blue") +
+  annotate("text", x = 80, y = 0.82, label = "80% threshold", color = "red") +
+  annotate("text", x = 80, y = 0.92, label = "90% threshold", color = "blue") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Cumulative Variance Explained by PCs",
+    x = "Number of Components",
+    y = "Cumulative Variance Explained"
+  ) +
+  theme_minimal()
+
+write_csv(scree_df, "results/scree_df.csv")
+saveRDS(pca_emb, "results/pca_emb.rds")
+
+```
+
+## Preprocessing Pipeline
+
+After selecting the number of principal components for the lyrics embeddings, a unified preprocessing pipeline is constructed using the *recipes* framework in R. This approach ensures that all data transformations are applied consistently within the modeling workflow and helps prevent information leakage between training and testing data.
+
+First, the lyrics embedding variables are assigned a separate role (“embedding”) so that dimensionality reduction can be applied specifically to these features. Principal component analysis is then performed on the embedding vectors, retaining the first 40 components as determined in the previous step.
+
+Second, categorical predictors are processed by handling previously unseen categories and converting them into dummy variables. 
+
+Finally, continuous predictors are standardized through normalization. Standardizing predictors ensures that variables measured on different scales contribute comparably during model training.
+
+These preprocessing steps are integrated directly into the modeling pipeline so that they are estimated using the training data and then applied consistently to validation and test data during model evaluation.
+
+
+```{r recipe, message=FALSE, warning=FALSE}
+emb_cols <- grep("^lyrics_emb_", names(train_data), value = TRUE)
+
+recipe_model <- recipe(peak_position ~ ., data = train_data) %>%
+  update_role(all_of(emb_cols), new_role = "embedding") %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_pca(has_role("embedding"), num_comp = 40) %>%
+
+  step_normalize(
+    log_volume,
+    log_controversy,
+    release_year,
+    log_followers,
+    danceability,
+    energy,
+    loudness,
+    speechiness,
+    acousticness,
+    instrumentalness,
+    liveness,
+    valence,
+    tempo,
+    log_duration,
+    starts_with("PC")
+  ) 
+
+```
+
+
+## Model Specification
+
+Three predictive models are estimated: LASSO regression, Random Forest, and Gradient Boosting (XGBoost). These models represent complementary approaches to prediction.
+
+LASSO regression provides a regularized linear benchmark that performs automatic variable selection through L1 penalization. This allows the model to identify the most relevant predictors while shrinking less informative coefficients toward zero.
+
+Random Forest represents a nonlinear tree-based ensemble method that captures complex interactions among predictors while reducing overfitting through bootstrap aggregation. In contrast, XGBoost implements gradient boosting, which sequentially builds trees to correct prediction errors from previous iterations and is widely used for high-performance predictive modeling.
+
+All models are implemented using the *tidymodels* framework. The preprocessing recipe described in the previous section is combined with each model specification through a unified workflow, ensuring that data transformations are applied consistently during cross-validation and model estimation.
+
+For computational reasons, the number of trees is fixed at 300 in both Random Forest and XGBoost. A larger number of trees could in principle improve stability, but it would also substantially increase runtime on the available hardware. The choice of 300 trees therefore reflects a practical compromise: large enough to provide flexible ensemble models, but small enough to keep tuning and estimation feasible.
+
+Model tuning then focuses on the most standard and substantively important hyperparameters. For LASSO, the regularization penalty is tuned. For Random Forest, tuning is performed over mtry and min_n. For XGBoost, tuning is performed over tree_depth, learn_rate, min_n, loss_reduction, sample_size, and mtry. 
+
+```{r model, message=FALSE, warning=FALSE}
+
+lasso_model <- linear_reg(
+  penalty = tune(),
+  mixture = 1
+) %>%
+  set_engine("glmnet")
+
+
+rf_model <- rand_forest(
+  trees = 300,
+  mtry = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+xgb_model <- boost_tree(
+  trees = 300,
+  tree_depth = tune(),
+  learn_rate = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+```
+
+```{r workflow, message=FALSE, warning=FALSE}
+wf_lasso <- workflow() %>%
+  add_recipe(recipe_model) %>%
+  add_model(lasso_model)
+
+wf_rf <- workflow() %>%
+  add_recipe(recipe_model) %>%
+  add_model(rf_model)
+
+wf_xgb <- workflow() %>%
+  add_recipe(recipe_model) %>%
+  add_model(xgb_model)
+
+```
+
+## Hyperparameter Tuning
+
+Hyperparameters are tuned using five-fold cross-validation on the training data.
+
+For Random Forest, mtry is restricted to 5–35 rather than the full range of predictors (1–54) to avoid extreme values that would either make trees overly random or reduce ensemble diversity. The parameter min_n is tuned over 2–15 to control tree depth, allowing the model to balance flexibility and overfitting.
+
+```{r param, message=FALSE, warning=FALSE}
+rf_param <- parameters(
+  mtry(range = c(5L, 35L)), 
+  min_n(range = c(2L, 15L))
+)%>%
+  finalize(train_data)
+
+xgb_param <- parameters(
+  tree_depth(),
+  learn_rate(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  mtry()
+) %>%
+  finalize(train_data)
+
+```
+
+For LASSO regression, the regularization penalty is tuned over a logarithmic range from 
+$10^{-4}$ to $10^{0}$, using 20 grid points. This range allows the model to explore both 
+weak and strong levels of regularization while maintaining a manageable tuning grid.
+
+For Random Forest, tuning is conducted over `mtry` and `min_n` using a regular grid with 
+four levels per parameter. This produces a moderate number of candidate configurations 
+while still allowing the model to explore different levels of tree complexity.
+
+For XGBoost, the parameter space is larger, so a space-filling design with 10 candidate 
+combinations is used instead of a full grid. This approach allows efficient coverage of 
+the multidimensional hyperparameter space while keeping the computational cost feasible.
+
+Overall, the tuning grids are intentionally kept moderate in size in order to balance 
+exploration of the hyperparameter space with computational feasibility.
+
+```{r tuning_grid, message=FALSE, warning=FALSE}
+set.seed(23)
+
+lasso_grid <- grid_regular(
+  penalty(range = c(-4, 0)),
+  levels = 20
+)
+
+rf_grid <- grid_regular(
+  rf_param,
+  levels = 4
+)
+
+xgb_grid <- grid_space_filling(
+  xgb_param,
+  size = 10
+)
+
+
+```
+
+
+```{r lasso_res, message=FALSE, warning=FALSE, cache=TRUE}
+set.seed(23)
+
+lasso_res <- tune_grid(
+  wf_lasso,
+  resamples = folds,
+  grid = lasso_grid,
+  metrics = metric_set(rmse, rsq)
+)
+
+saveRDS(lasso_res, "results/lasso_res.rds")
+```
+
+```{r lasso_best, message=FALSE, warning=FALSE, include=FALSE}
+show_best(lasso_res, metric = "rmse")
+collect_metrics(lasso_res)
+```
+
+
+```{r rf_res, message=FALSE, warning=FALSE, cache=TRUE}
+set.seed(23)
+ctrl <- control_grid(verbose = TRUE)
+
+rf_res <- tune_grid(
+  wf_rf,
+  resamples = folds,
+  grid = rf_grid,
+  metrics = metric_set(rmse, rsq),
+  control = ctrl
+)
+
+saveRDS(rf_res, "results/rf_res.rds")
+
+```
+
+```{r rf_best, message=FALSE, warning=FALSE,include=FALSE}
+show_best(rf_res, metric = "rmse")
+collect_metrics(rf_res)
+```
+
+
+Figure 8 presents the tuning results for the Random Forest model. The model achieves its best predictive performance when approximately 15 predictors are randomly selected at each split (`mtry ≈ 15`). Performance differences across minimal node sizes (`min_n`) are relatively small, suggesting that model performance is more sensitive to the choice of `mtry` than to `min_n`. 
+
+Overall, the tuning surface is relatively smooth and performance differences across parameter combinations are modest, indicating that the model is not highly sensitive to hyperparameter choices within the explored range. This pattern suggests that predictive signals are relatively dispersed across predictors rather than concentrated in a small subset of variables. 
+
+```{r rf_plot, message=FALSE, warning=FALSE}
+autoplot(rf_res)
+
+```
+
+```{r xgb_res, message=FALSE, warning=FALSE, cache=TRUE}
+set.seed(23)
+ctrl <- control_grid(verbose = TRUE)
+
+xgb_res <- tune_grid(
+  wf_xgb,
+  resamples = folds,
+  grid = xgb_grid,
+  metrics = metric_set(rmse, rsq),
+  control = ctrl
+)
+
+saveRDS(xgb_res, "results/xgb_res.rds")
+
+```
+
+```{r xgb_best, message=FALSE, warning=FALSE, include=FALSE}
+show_best(xgb_res, metric = "rmse")
+collect_metrics(xgb_res)
+```
+
+
+## Model Results
+
+Comparing the tuning results across models, the Random Forest model achieves the best predictive performance, with the lowest RMSE among the three approaches. However, the corresponding $R^2$ values still remain relatively modest, indicating that the overall explanatory power of the models is limited.
+
+This suggests that the predictive signal contained in the available features is relatively weak or diffuse. In other words, the models appear to produce stable but only moderately predictive results. One possible explanation is that the popularity of music is inherently difficult to predict, and chart outcomes such as peak position are influenced by many external factors that are not captured in the dataset. In addition, chart-based measures themselves can be noisy indicators of popularity.
+
+```{r compare, message=FALSE, warning=FALSE, include=FALSE}
+show_best(lasso_res, metric = "rmse")
+show_best(lasso_res, metric = "rsq")
+
+show_best(rf_res, metric = "rmse")
+show_best(rf_res, metric = "rsq")
+
+show_best(xgb_res, metric = "rmse")
+show_best(xgb_res, metric = "rsq")
+```
+
+```{r model_compare_table, message=FALSE, warning=FALSE, echo=FALSE}
+
+lasso_rmse <- show_best(lasso_res, metric = "rmse", n = 1) %>%
+  transmute(Model = "LASSO", RMSE = round(mean, 3))
+
+lasso_rsq <- show_best(lasso_res, metric = "rsq", n = 1) %>%
+  transmute(Model = "LASSO", R2 = round(mean, 3))
+
+rf_rmse <- show_best(rf_res, metric = "rmse", n = 1) %>%
+  transmute(Model = "Random Forest", RMSE = round(mean, 3))
+
+rf_rsq <- show_best(rf_res, metric = "rsq", n = 1) %>%
+  transmute(Model = "Random Forest", R2 = round(mean, 3))
+
+xgb_rmse <- show_best(xgb_res, metric = "rmse", n = 1) %>%
+  transmute(Model = "XGBoost", RMSE = round(mean, 3))
+
+xgb_rsq <- show_best(xgb_res, metric = "rsq", n = 1) %>%
+  transmute(Model = "XGBoost", R2 = round(mean, 3))
+
+model_compare <- bind_rows(lasso_rmse, rf_rmse, xgb_rmse) %>%
+  left_join(bind_rows(lasso_rsq, rf_rsq, xgb_rsq), by = "Model")
+
+kable(model_compare, caption = "Best Cross-Validated Performance by Model")
+```
+
+## Final Random Forest Model Training
+
+The best Random Forest hyperparameters are selected from the cross-validation results using RMSE as the criterion. These values are then finalized in the workflow, and the model is refit on the full training data. This produces the final Random Forest model for subsequent test-set evaluation.
+
+```{r final_rf_fit, message=FALSE, warning=FALSE, cache=TRUE}
+best_rf_param <- select_best(rf_res, metric = "rmse")
+
+best_rf_wf <- finalize_workflow(
+  wf_rf,
+  best_rf_param
+)
+
+final_rf_fit <- fit(best_rf_wf, data = train_data)
+
+saveRDS(best_rf_param, "results/best_rf_param.rds")
+saveRDS(best_rf_wf, "results/best_rf_wf.rds")
+saveRDS(final_rf_fit, "results/final_rf_fit.rds")
+
+```
+
+
+## Variable Importance in the Random Forest Model
+
+The resulting variable importance plot indicates that `log_followers` is by far the most influential predictor of peak chart position. Measures related to online discussion, such as `log_controversy` and `log_volume`, also contribute meaningfully to predictive performance. In addition, several principal components derived from lyric embeddings (e.g., PC05 and PC04) appear among the top predictors, suggesting that certain latent textual characteristics of lyrics may contain modest predictive signal.
+
+```{r vip, message=FALSE, warning=FALSE, cache=TRUE}
+
+trained_recipe <- prep(recipe_model)
+train_processed <- bake(trained_recipe, new_data = NULL)
+
+rf_vip_spec <- rand_forest(
+  trees = 300,
+  mtry = best_rf_param$mtry,
+min_n = best_rf_param$min_n
+) %>%
+  set_engine("ranger", importance = "impurity", num.threads = parallel::detectCores()) %>%
+  set_mode("regression")
+
+rf_vip_fit_fast <- rf_vip_spec %>%
+  fit(peak_position ~ ., data = train_processed)
+
+vip(rf_vip_fit_fast, num_features = 20)
+
+saveRDS(train_processed, "results/train_processed.rds")
+saveRDS(rf_vip_fit_fast, "results/rf_vip_fit_fast.rds")
+
+```
+
+## Global Model Interpretation Using SHAP
+
+To interpret the model, I use SHAP (Shapley Additive Explanations) to provide a global summary of feature contributions. The SHAP plot shows that most predictors have relatively small effects, with the majority of SHAP values concentrated near zero. This suggests that many variables influence chart performance only weakly or in a context-dependent way.
+
+Two predictors stand out with noticeably larger SHAP ranges: artist popularity (log_followers) and online controversy (log_controversy), indicating that the model is largely driven by a small number of influential features.
+
+Among them, artist popularity (log_followers) emerges as the most important predictor. Higher values (shown in yellow) appear mostly on the positive side of the SHAP axis, suggesting that songs released by artists with larger follower bases tend to achieve better predicted chart performance. Similarly, higher controversy levels (log_controversy) are associated with positive SHAP values, suggesting that polarizing discussion may increase attention and potentially improve chart outcomes.
+
+```{r shap, message=FALSE, warning=FALSE, cache=TRUE}
+rf_recipe_prep <- extract_recipe(final_rf_fit, estimated = TRUE)
+train_baked <- bake(rf_recipe_prep, new_data = train_data)
+
+rf_engine <- extract_fit_parsnip(final_rf_fit)$fit
+
+pred_wrapper <- function(object, newdata) {
+  predict(object, data = newdata)$predictions
+}
+
+set.seed(123)
+
+shap_X_small <- train_baked %>%
+  select(-peak_position) %>%
+  slice_sample(n = 100) %>%
+  as.data.frame()
+
+bg_X_small <- train_baked %>%
+  select(-peak_position) %>%
+  slice_sample(n = 80) %>%
+  as.data.frame()
+
+rf_shap_mat <- fastshap::explain(
+  object = rf_engine,
+  X = bg_X_small,
+  newdata = shap_X_small,
+  pred_wrapper = pred_wrapper,
+  nsim = 10,
+  adjust = FALSE
+)
+
+sv_rf <- shapviz(rf_shap_mat, X = shap_X_small)
+sv_importance(sv_rf, kind = "beeswarm")
+
+saveRDS(shap_X_small, "results/shap_X_small.rds")
+saveRDS(bg_X_small, "results/bg_X_small.rds")
+saveRDS(rf_shap_mat, "results/rf_shap_mat.rds")
+
+
+```
+
+
+
+## Model Performance
+
+To evaluate the predictive performance of the final random forest model, I computed standard regression metrics on the test dataset, including RMSE, MAE, and $R^2$.
+
+The model achieved an RMSE of `r round(20.8621791, 2)`, an MAE of `r round(15.4777428, 2)`, and an $R^2$ of `r round(0.2098144, 2)`. These results suggest that the model captures a moderate share of the variation in chart performance.
+
+Notably, the test RMSE is close to the training / cross-validation RMSE obtained earlier, indicating that the model generalizes reasonably well and that severe overfitting is unlikely. 
+
+```{r test_data, message=FALSE, warning=FALSE}
+rf_test_pred <- predict(final_rf_fit, new_data = test_data) %>%
+  bind_cols(test_data %>% select(peak_position))
+
+```
+
+
+```{r evaluation,  message=FALSE, warning=FALSE}
+metrics(rf_test_pred, truth = peak_position, estimate = .pred)
+
+```
+
+
+### Test Set Prediction
+
+Figure below compares predicted and actual values on the test set. The dashed line
+represents perfect prediction.
+
+The model captures a general positive relationship, but prediction errors
+remain relatively large. One clear pattern is that predictions fall within a
+narrower range than the actual values. This reflects a common property of
+random forest models: predictions tend to be pulled toward the average.
+
+As a result, very successful songs are often underpredicted, while poorly
+performing songs are overpredicted. In addition, online discussion does not
+always translate into chart success, which introduces additional noise into the
+prediction task.
+
+```{r plot, message=FALSE, warning=FALSE}
+ggplot(rf_test_pred, aes(x = peak_position, y = .pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(linetype = "dashed") +
+  labs(
+    x = "Actual",
+    y = "Predicted",
+    title = "Random Forest: Test Set Predictions"
+  )
+
+```
+
+
+# Conclusion
+
+Overall, the predictive performance of the model is moderate, reflecting the
+inherently noisy and difficult-to-predict nature of music popularity. However,
+the results still reveal meaningful patterns. In particular, social media
+signals appear to play a more important role than many intrinsic musical
+features in explaining chart performance.
+
+Among the variables, controversy shows a clear positive relationship with peak
+performance: songs associated with higher levels of controversial discussion
+tend to achieve better chart outcomes. Importantly, controversy differs from
+simple discussion volume. While volume measures the amount of attention,
+controversy reflects the intensity and polarization of audience reactions.
+
+These findings suggest that attracting **high-engagement or polarizing
+discussion** may be more effective than simply increasing the overall amount
+of online mentions. From a strategic perspective, entertainment companies may
+benefit from generating **high-quality, attention-grabbing topics** that spark
+discussion rather than merely increasing promotional volume.
+
+
+# Limitations and Future Work
+
+Several limitations remain in this study. First, the relationship between
+`peak_position` and `weeks_on_chart` deserves further investigation. The
+scatter plot suggests a possible negative relationship between these two
+variables, which could motivate revised hypotheses or alternative outcome
+measures.
+
+Second, some features—such as the lyric embedding component PC05 and several
+extreme observations—are difficult to interpret. Future work could examine
+these components more closely to understand what linguistic or thematic
+patterns they represent.
+
+Third, the Reddit discussion data could be analyzed in more depth. Instead of
+using aggregated measures alone, unsupervised approaches such as topic
+modeling (e.g., BERTopic) could be applied to explore the thematic structure
+of discussions and how different types of discourse relate to chart outcomes.
+
+Finally, the dataset lacks several important factors that often determine
+commercial success, including Spotify or radio promotion, TikTok viral
+effects, playlist placement, marketing budgets, media exposure, and release
+timing relative to competing songs. The absence of these variables likely
+limits the model’s predictive accuracy and contributes to the large residual
+variation observed in the results.
